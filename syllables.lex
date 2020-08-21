@@ -146,7 +146,7 @@ void merge_range (token_t token, off_t l_bound, off_t u_bound)
 {
 	element_t **temp_buffer = NULL;
 	off_t temp_buffer_ptr = 0;
-	printf("merge_range(.., l_bound = %lld, u_bound = %lld)\n", l_bound, u_bound);
+
 	// Bound checks
 	assert(l_bound <= u_bound);
 	assert(l_bound >= 0 && u_bound < g_element_stack_size);
@@ -265,75 +265,73 @@ void merge_stack ()
 	} while (can_merge_more);
 }
 
+// Try to merge syllables along stack according to these rules
+// 1. If two vowels are separated by one consonant -> consonant forms beginning of next syllable
+// 2. If two vowels are separated by more than one consonant -> first vowel gets first consonant
+//    the rest form a new syllable with the second
+// 3. Syllable types may not be merged with other vowels or consonants
 bool merge_syllables ()
 {
-	// Try to merge syllables along stack according to these rules
-	// 1. If two vowels are separated by one consonant -> consonant forms beginning of next syllable
-	// 2. If two vowels are separated by more than one consonant -> first vowel gets first consonant
-	//    the rest form a new syllable with the second
-	// 3. Syllable types may not be merged with other vowels or consonants
 	off_t i, j, n, l_bound, u_bound;
 	bool needs_merge = false;
 
-	// Move to find next consonant or vowel
+	// Objective: Find next consonant or vowel (skip syllables)
 	for (i = 0; (i < g_element_stack_size) && (g_element_stack[i]->token == TOK_SYLLABLE); ++i);
 
-	// Check if nothing found
-	if (i >= g_element_stack_size) { printf("1. Not found -> ret\n"); return needs_merge; }
+	// Case: None found -> nothing left to do
+	if (i >= g_element_stack_size) { return needs_merge; }
 
-	// Mark the lower bound
-	l_bound = i; printf("l_bound = %lld\n", l_bound);
+	// Case: A consonant or vowel was found
+	l_bound = i;
 
-	// Find the first vowel (but do not cross syllables)
+	// Objective: Find the first vowel (but do not cross syllables)
 	while (i < g_element_stack_size && 
 	      (g_element_stack[i]->token != TOK_VOWEL && g_element_stack[i]->token != TOK_SYLLABLE)) {
 		i++;
 	}
 
-	// If nothing found, or a syllable found: conclude here
+	// Case: If nothing found, or a syllable found: merge now
 	if (i >= g_element_stack_size || g_element_stack[i]->token == TOK_SYLLABLE) {
 		printf("2. Not found or syllable found!\n");
 		u_bound = i - 1;
 		goto merge;
 	}
 
-	// Otherwise a vowel was found, and resides at index i
+	// Result: A vowel was found, and it resides at index i
 
-	// Search for next vowel
+	// Objective: Find next vowel, but don't across syllables to find one
 	for (j = i + 1; j < g_element_stack_size && 
-	    (g_element_stack[j]->token != TOK_VOWEL && g_element_stack[j]->token != TOK_SYLLABLE); ++j);
+	    (g_element_stack[j]->token != TOK_VOWEL && g_element_stack[j]->token != TOK_SYLLABLE); 
+		++j);
 
-	// If j is out of bounds, there was no other vowel.
+	// Case: j ran out of bounds -> no vowel or syllable found
 	if (j >= g_element_stack_size) {
-		printf("3. No other vowel found j=%lld\n", j);
 		u_bound = j - 1;
 		goto merge;
 	}
 
-	// If j is in bounds, but on a syllable: Need to merge here
+	// Case: j is in bounds, but found a syllable -> merge early
 	if (g_element_stack[j]->token == TOK_SYLLABLE) {
-		printf("4. Syllable at j=%lld\n", j);
 		u_bound = j - 1;
 		goto merge;
 	}
 
-	// Otherwise it is a vowel. Action depends on how many consonants sit between
-	printf("n = %lld - %lld - 1\n", j, i);
+	// Result: Must be vowel; Action: Depends on number of consonants between them
 	n = (j - i - 1);
 
-
-	// If one or no consonant(s): Push to next syllable. Else: Take one, push rest
+	// Case: No or one consonant -> push remainder to next syllable
 	if (n <= 1) {
-		printf("one consonant, u_bound = %lld\n", i);
 		u_bound = i;
 	} else {
-		printf("more than one consonant, u_bound = %lld\n", i + 1);
+	// Case: More than one       -> take first consonant, push remainder
 		u_bound = i + 1;
 	}
 
+	// Merge elements into syllables
 merge:
 	merge_range (TOK_SYLLABLE, l_bound, u_bound);
 
+	// Return whether more remains to be checked
 	return (u_bound < g_element_stack_size);
 }
 
