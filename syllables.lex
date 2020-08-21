@@ -1,5 +1,9 @@
 %{
 	// TODO: Accept Dieresis (unicode required)
+	// TODO: Decompose difficult syllables according to known rules post-formation
+	// TODO: Memory leak detection
+	// NOTE: The 'be' prefix doesn't always apply (see be-stu-ren vs bel-gi-sche)
+	// NOTE: No support for compound words
 
 	#include <ctype.h>
 	#include <stdbool.h>
@@ -28,6 +32,7 @@
 	void delete_element (element_t *);
 	void debug_stack();
 	void merge_stack();
+	bool merge_syllables();
 	void dump_stack();
 %}
 
@@ -40,16 +45,16 @@ consonant_1        [a-zA-Z]{-}[aeiouAEIOU]
 whitespace         [ \t\n]
 
 %%
-achtig             { push_element(make_element(TOK_SYLLABLE, "ach-tig")); }
-thische            { push_element(make_element(TOK_SYLLABLE, "thi-sche"));}
-thisch             { push_element(make_element(TOK_SYLLABLE, "thi-sch")); }
+achtig             { push_element(make_element(TOK_SYLLABLE, "ach.tig")); }
+thische            { push_element(make_element(TOK_SYLLABLE, "thi.sche"));}
+thisch             { push_element(make_element(TOK_SYLLABLE, "thi.sch")); }
 {syllable_1}       { push_element(make_element(TOK_SYLLABLE, yytext));    }
 {vowel_3}          { push_element(make_element(TOK_VOWEL, yytext));       }
 {vowel_2}          { push_element(make_element(TOK_VOWEL, yytext));       }
 {consonant_2}      { push_element(make_element(TOK_CONSONANT, yytext));   }
 {vowel_1}          { push_element(make_element(TOK_VOWEL, yytext));       }
 {consonant_1}      { push_element(make_element(TOK_CONSONANT, yytext));   }
-{whitespace}       { debug_stack(); merge_stack(); dump_stack();          }
+{whitespace}       { debug_stack(); merge_stack(); debug_stack(); putchar('\n'); dump_stack(); }
 (.)                { putchar(*yytext);                                    }
 
 %%
@@ -60,6 +65,7 @@ size_t g_element_stack_size = 0;
 char    g_word_char_map[MAX_WORD_LENGTH];
 uint8_t g_word_syllable_offset[MAX_WORD_LENGTH];
 size_t  g_word_length = 0;
+
 
 void make_syllable_offset_map ()
 {
@@ -107,26 +113,82 @@ element_t *pop_element ()
 	return g_element_stack[--g_element_stack_size];
 }
 
-// Allocates new element merging two similar elements; assigns given token
-element_t *merge_element (token_t token, element_t *a, element_t *b)
+
+// Merges child into parent (destroys child); updates parent with given token
+element_t *merge_from_right (token_t token, element_t *parent, element_t *child)
 {
 	// Validate input; compute length of merged lexeme
-	assert(!(a == NULL || a->lexeme == NULL));
-	assert(!(b == NULL || b->lexeme == NULL));
-	size_t len = strlen(a->lexeme) + strlen(b->lexeme);
+	assert(!(parent == NULL || parent->lexeme == NULL));
+	assert(!(child == NULL || child->lexeme == NULL));
+	size_t len = strlen(parent->lexeme) + strlen(child->lexeme);
 
-	// Create merged lexeme
+	// Create merged lexeme (child goes before parent since merging from right)
 	char *merged_lexeme = malloc((len + 1) * sizeof(char));
 	assert(merged_lexeme != NULL);
-	sprintf(merged_lexeme, "%s%s", a->lexeme, b->lexeme);
+	sprintf(merged_lexeme, "%s%s", child->lexeme, parent->lexeme);
 
-	// Obtain new element
-	element_t *merged_element = make_element(token, merged_lexeme);
+	// Free the old parent lexeme
+	free((char *)parent->lexeme);
 
-	// Release allocated memory
-	free(merged_lexeme);
+	// Assign the new lexeme
+	parent->lexeme = merged_lexeme;
 
-	return merged_element;
+	// Destroy the child element
+	delete_element(child);
+
+	// Update the token type
+	parent->token = token;
+
+	return parent;
+}
+
+void merge_range (token_t token, off_t l_bound, off_t u_bound)
+{
+	element_t **temp_buffer = NULL;
+	off_t temp_buffer_ptr = 0;
+	printf("merge_range(.., l_bound = %lld, u_bound = %lld)\n", l_bound, u_bound);
+	// Bound checks
+	assert(l_bound <= u_bound);
+	assert(l_bound >= 0 && u_bound < g_element_stack_size);
+
+	// Check: Same element
+	if (l_bound == u_bound) {
+		g_element_stack[l_bound]->token = token;
+		return;
+	}
+
+	// Compute number of elements to hold
+	size_t n_elements_to_hold = g_element_stack_size - u_bound;
+
+	// Allocate a copy buffer
+	temp_buffer = malloc(n_elements_to_hold * sizeof(element_t *));
+	assert(temp_buffer != NULL);
+
+	// Remove until top bound
+	while (g_element_stack_size > (u_bound + 1)) {
+		temp_buffer[temp_buffer_ptr++] = pop_element();
+	}
+
+	// Next is top bound
+	element_t *parent = pop_element();
+
+	// Until bottom bound, merge elements into it
+	while (g_element_stack_size > l_bound)
+	{
+		element_t *child = pop_element();
+		merge_from_right(token, parent, child);
+	}
+
+	// Push merged back onto stack
+	push_element(parent);
+
+	// Return all other elements
+	for (off_t i = temp_buffer_ptr; i > 0; --i) {
+		push_element(temp_buffer[i - 1]);
+	}
+
+	// Destroy the temporary buffer
+	free(temp_buffer);
 }
 
 void delete_element (element_t *e)
@@ -169,18 +231,110 @@ void debug_stack ()
 
 void merge_stack ()
 {
+	static const char *prefixes[] = {"be", "er", "ge", "her", "ont", "ver"};
+	size_t n_prefixes             = sizeof(prefixes) / sizeof(const char *);
+	bool can_merge_more           = false;
+
 	// Compute the offset map
 	make_syllable_offset_map();
 
-	// Print the offset map
-	for (int i = 0; i < g_word_length; ++i) {
-		printf("%c ", g_word_char_map[i]);
+	// Find and merge prefixes into syllables (isn't always correct)
+	for (off_t i = 0; i < n_prefixes; ++i) {
+		size_t prefix_len = strlen(prefixes[i]);
+
+		// If a prefix matches
+		if (strncmp(prefixes[i], g_word_char_map, prefix_len) == 0) {
+
+			// Find the number of elements to merge
+			uint8_t n_merge = g_word_syllable_offset[prefix_len - 1];
+
+			// Letters that appear beyond should be independent
+			if (g_word_syllable_offset[prefix_len] == g_word_syllable_offset[prefix_len -1]) {
+				break;
+			}
+
+			// Do the merge
+			merge_range (TOK_SYLLABLE, 0, n_merge);
+			break;
+		}
 	}
-	putchar('\n');
-	for (int i = 0; i < g_word_length; ++i) {
-		printf("%d ", g_word_syllable_offset[i]);
+
+	// Merge syllables according to rules
+	do {
+		can_merge_more = merge_syllables();
+	} while (can_merge_more);
+}
+
+bool merge_syllables ()
+{
+	// Try to merge syllables along stack according to these rules
+	// 1. If two vowels are separated by one consonant -> consonant forms beginning of next syllable
+	// 2. If two vowels are separated by more than one consonant -> first vowel gets first consonant
+	//    the rest form a new syllable with the second
+	// 3. Syllable types may not be merged with other vowels or consonants
+	off_t i, j, n, l_bound, u_bound;
+	bool needs_merge = false;
+
+	// Move to find next consonant or vowel
+	for (i = 0; (i < g_element_stack_size) && (g_element_stack[i]->token == TOK_SYLLABLE); ++i);
+
+	// Check if nothing found
+	if (i >= g_element_stack_size) { printf("1. Not found -> ret\n"); return needs_merge; }
+
+	// Mark the lower bound
+	l_bound = i; printf("l_bound = %lld\n", l_bound);
+
+	// Find the first vowel (but do not cross syllables)
+	while (i < g_element_stack_size && 
+	      (g_element_stack[i]->token != TOK_VOWEL && g_element_stack[i]->token != TOK_SYLLABLE)) {
+		i++;
 	}
-	putchar('\n');
+
+	// If nothing found, or a syllable found: conclude here
+	if (i >= g_element_stack_size || g_element_stack[i]->token == TOK_SYLLABLE) {
+		printf("2. Not found or syllable found!\n");
+		u_bound = i - 1;
+		goto merge;
+	}
+
+	// Otherwise a vowel was found, and resides at index i
+
+	// Search for next vowel
+	for (j = i + 1; j < g_element_stack_size && 
+	    (g_element_stack[j]->token != TOK_VOWEL && g_element_stack[j]->token != TOK_SYLLABLE); ++j);
+
+	// If j is out of bounds, there was no other vowel.
+	if (j >= g_element_stack_size) {
+		printf("3. No other vowel found j=%lld\n", j);
+		u_bound = j - 1;
+		goto merge;
+	}
+
+	// If j is in bounds, but on a syllable: Need to merge here
+	if (g_element_stack[j]->token == TOK_SYLLABLE) {
+		printf("4. Syllable at j=%lld\n", j);
+		u_bound = j - 1;
+		goto merge;
+	}
+
+	// Otherwise it is a vowel. Action depends on how many consonants sit between
+	printf("n = %lld - %lld - 1\n", j, i);
+	n = (j - i - 1);
+
+
+	// If one or no consonant(s): Push to next syllable. Else: Take one, push rest
+	if (n <= 1) {
+		printf("one consonant, u_bound = %lld\n", i);
+		u_bound = i;
+	} else {
+		printf("more than one consonant, u_bound = %lld\n", i + 1);
+		u_bound = i + 1;
+	}
+
+merge:
+	merge_range (TOK_SYLLABLE, l_bound, u_bound);
+
+	return (u_bound < g_element_stack_size);
 }
 
 void dump_stack ()
@@ -202,7 +356,3 @@ int main (int argc, char *argv[])
 
 	return EXIT_SUCCESS;
 }
-
-
-
-
